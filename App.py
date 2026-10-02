@@ -25,6 +25,23 @@ api_key = st.sidebar.text_input(
     help="Get an API key from Google AI Studio",
 )
 
+# Initialize client to find available models for your account
+available_models = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-8b", "gemini-1.5-pro"]
+if api_key.strip():
+    try:
+        temp_client = genai.Client(api_key=api_key.strip())
+        fetched_models = [
+            m.name.replace("models/", "")
+            for m in temp_client.models.list()
+            if "generateContent" in (m.supported_actions or [])
+        ]
+        if fetched_models:
+            available_models = fetched_models
+    except Exception:
+        pass
+
+selected_model = st.sidebar.selectbox("Active Gemini Model", available_models, index=0)
+
 class SubjectEntry(BaseModel):
     sub_code: str = Field(description="Subject code, e.g., 43A, 43B")
     subject_name: str = Field(description="Full name of subject")
@@ -36,8 +53,7 @@ class StudentResult(BaseModel):
     student_name: str = Field(description="Student Full Name")
     subjects: list[SubjectEntry] = Field(description="All subjects listed on the marksheet")
 
-def parse_marks(mark_str: str) -> tuple[int, int]:
-    """Parse '018+048' into (total_marks, status_flag)."""
+def parse_marks(mark_str: str) -> int:
     try:
         parts = mark_str.replace(" ", "").split("+")
         if len(parts) == 2:
@@ -48,19 +64,20 @@ def parse_marks(mark_str: str) -> tuple[int, int]:
         pass
     return 0
 
-def extract_result(client: genai.Client, pil_img: Image.Image) -> dict:
+def extract_result(client: genai.Client, pil_img: Image.Image, model_name: str) -> dict:
     prompt = (
         "Extract register number, student name, and all subject rows (sub code, subject name, marks, and result). "
         "Return strictly valid JSON matching schema."
     )
     
-    # Convert image to bytes to ensure safe transfer
+    # Compress/resize image to under 1.5MB for fast upload
+    pil_img.thumbnail((1600, 1600))
     img_byte_arr = io.BytesIO()
-    pil_img.save(img_byte_arr, format="JPEG")
+    pil_img.save(img_byte_arr, format="JPEG", quality=85)
     img_bytes = img_byte_arr.getvalue()
 
     res = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model=model_name,
         contents=[
             prompt,
             types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
@@ -99,7 +116,7 @@ if uploaded_files:
                 status_text.text(f"Extracting ({idx+1}/{len(uploaded_files)}): {f.name}")
                 try:
                     img = Image.open(f).convert("RGB")
-                    data = extract_result(client, img)
+                    data = extract_result(client, img, selected_model)
 
                     reg_no = data.get("register_number", "Unknown")
                     name = data.get("student_name", "Unknown")
@@ -125,7 +142,6 @@ if uploaded_files:
                         sub_total = parse_marks(mark_str)
                         total_marks += sub_total
 
-                        # Show mark string along with fail marker if failed
                         if res_val == "F":
                             failed_subjects.append(f"{s_name} ({code})")
                             row_data[subject_col_name] = f"{sub_total} [FAIL]"
@@ -153,7 +169,6 @@ if uploaded_files:
 
             status_text.text("Extraction complete!")
 
-            # Reorder columns neatly: Reg No, Name, [All Subjects], Total, Result, Failed Subjects, Arrears
             final_columns = ["Register Number", "Student Name"] + all_discovered_subjects + [
                 "Total Marks",
                 "Result",
@@ -162,7 +177,6 @@ if uploaded_files:
             ]
 
             df = pd.DataFrame(all_records)
-            # Ensure any missing columns across different images are safely filled with '-'
             for c in final_columns:
                 if c not in df.columns:
                     df[c] = "-"
@@ -171,7 +185,6 @@ if uploaded_files:
             st.subheader("📋 Class Consolidated Marks")
             st.dataframe(df, use_container_width=True)
 
-            # Export Excel
             excel_buffer = io.BytesIO()
             with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
                 df.to_excel(writer, sheet_name="Consolidated_Marks", index=False)
