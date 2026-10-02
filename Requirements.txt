@@ -1,0 +1,7 @@
+streamlit
+pillow
+pandas
+openpyxl
+numpy
+pydantic
+google-genai
