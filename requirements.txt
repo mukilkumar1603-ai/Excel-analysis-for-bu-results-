@@ -2,6 +2,8 @@ streamlit
 pillow
 pandas
 openpyxl
-numpy
 pydantic
 google-genai
+python-docx
+reportlab
+pypdf
