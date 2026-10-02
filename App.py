@@ -53,9 +53,18 @@ def extract_result(client: genai.Client, pil_img: Image.Image) -> dict:
         "Extract register number, student name, and all subject rows (sub code, subject name, marks, and result). "
         "Return strictly valid JSON matching schema."
     )
+    
+    # Convert image to bytes to ensure safe transfer
+    img_byte_arr = io.BytesIO()
+    pil_img.save(img_byte_arr, format="JPEG")
+    img_bytes = img_byte_arr.getvalue()
+
     res = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=[prompt, pil_img],
+        model="gemini-2.0-flash",
+        contents=[
+            prompt,
+            types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+        ],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=StudentResult,
