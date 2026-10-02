@@ -1,215 +1,185 @@
 import io
 import json
 import os
-import numpy as np
+import re
 import pandas as pd
-from PIL import Image, ImageStat
-from PIL.ExifTags import TAGS
+from PIL import Image
 from pydantic import BaseModel, Field
 import streamlit as st
 from google import genai
 from google.genai import types
 
-st.set_page_config(page_title="AI Batch Image Analyzer (50 Pics)", layout="wide")
+st.set_page_config(page_title="College Marksheet Consolidation", layout="wide")
 
-st.title("🤖 50 Photo AI Vision & Metadata Analyzer")
+st.title("🎓 Student Marksheet Consolidated Report")
 st.write(
-    "Upload up to 50 photos. The app extracts technical attributes, EXIF data, "
-    "and queries Gemini for semantic descriptions, keywords, and safety checks before exporting to Excel."
+    "Upload up to 50 result screenshots. Each student will get a single row "
+    "showing their marks under actual subject names, Grand Total, and list of failed subjects."
 )
 
-# Sidebar for Configuration
 st.sidebar.header("🔑 AI Settings")
-api_key_input = st.sidebar.text_input(
+api_key = st.sidebar.text_input(
     "Gemini API Key",
     type="password",
     value=os.environ.get("GEMINI_API_KEY", ""),
-    help="Get an API key from Google AI Studio. You can also export GEMINI_API_KEY in your shell.",
+    help="Get an API key from Google AI Studio",
 )
 
-model_name = st.sidebar.selectbox(
-    "Vision Model",
-    options=["gemini-2.5-flash", "gemini-2.0-flash"],
-    index=0,
-)
+class SubjectEntry(BaseModel):
+    sub_code: str = Field(description="Subject code, e.g., 43A, 43B")
+    subject_name: str = Field(description="Full name of subject")
+    marks: str = Field(description="Marks string e.g. 018+048")
+    result: str = Field(description="'P' or 'F'")
 
-# File uploader (up to 50 files)
+class StudentResult(BaseModel):
+    register_number: str = Field(description="Student Register Number")
+    student_name: str = Field(description="Student Full Name")
+    subjects: list[SubjectEntry] = Field(description="All subjects listed on the marksheet")
+
+def parse_marks(mark_str: str) -> tuple[int, int]:
+    """Parse '018+048' into (total_marks, status_flag)."""
+    try:
+        parts = mark_str.replace(" ", "").split("+")
+        if len(parts) == 2:
+            return int(parts[0]) + int(parts[1])
+        elif len(parts) == 1 and parts[0].isdigit():
+            return int(parts[0])
+    except Exception:
+        pass
+    return 0
+
+def extract_result(client: genai.Client, pil_img: Image.Image) -> dict:
+    prompt = (
+        "Extract register number, student name, and all subject rows (sub code, subject name, marks, and result). "
+        "Return strictly valid JSON matching schema."
+    )
+    res = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[prompt, pil_img],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=StudentResult,
+            temperature=0.0,
+        ),
+    )
+    return json.loads(res.text)
+
 uploaded_files = st.file_uploader(
-    "Choose up to 50 images (JPG, PNG, WEBP)",
-    type=["jpg", "jpeg", "png", "webp"],
+    "Upload marksheet screenshots (up to 50)",
+    type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=True,
 )
 
-# Pydantic schema for structured AI vision output
-class ImageAIAnalysis(BaseModel):
-    caption: str = Field(description="A 1-2 sentence detailed description of the scene.")
-    subject_category: str = Field(description="Main category, e.g. Landscape, Portrait, Architecture, Document, Product, Animal.")
-    tags: list[str] = Field(description="5 to 8 relevant semantic tags or keywords.")
-    safety_flag: str = Field(description="'Safe' or specific concern like 'Explicit', 'Violent', 'PII/Sensitive'.")
-
-def get_exif_data(image: Image.Image) -> dict:
-    """Extract standard camera EXIF parameters."""
-    details = {"Camera Model": "N/A", "Date Taken": "N/A", "ISO": "N/A"}
-    try:
-        exif = image.getexif()
-        if exif:
-            for tag_id, val in exif.items():
-                tag_name = TAGS.get(tag_id, tag_id)
-                if tag_name == "Model":
-                    details["Camera Model"] = str(val)
-                elif tag_name == "DateTime":
-                    details["Date Taken"] = str(val)
-                elif tag_name == "ISOSpeedRatings":
-                    details["ISO"] = str(val)
-    except Exception:
-        pass
-    return details
-
-def run_gemini_analysis(client: genai.Client, image: Image.Image, model_id: str) -> dict:
-    """Query Gemini multimodal API with structured JSON output schema."""
-    prompt = (
-        "Analyze this image carefully. Provide a concise, clear caption, identify the "
-        "primary subject category, extract descriptive tags, and flag any safety concerns."
-    )
-    try:
-        response = client.models.generate_content(
-            model=model_id,
-            contents=[prompt, image],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=ImageAIAnalysis,
-                temperature=0.2,
-            ),
-        )
-        parsed = json.loads(response.text)
-        return {
-            "AI Caption": parsed.get("caption", "N/A"),
-            "AI Category": parsed.get("subject_category", "N/A"),
-            "AI Tags": ", ".join(parsed.get("tags", [])),
-            "AI Safety Flag": parsed.get("safety_flag", "Safe"),
-        }
-    except Exception as e:
-        return {
-            "AI Caption": f"API Error: {str(e)}",
-            "AI Category": "Error",
-            "AI Tags": "",
-            "AI Safety Flag": "Unchecked",
-        }
-
-def analyze_photo(file, index, client, model_id):
-    """Run full pipeline: technical specs, EXIF, and AI analysis."""
-    try:
-        file.seek(0)
-        img_bytes = file.read()
-        file_size_kb = round(len(img_bytes) / 1024, 2)
-        
-        with Image.open(io.BytesIO(img_bytes)) as pil_img:
-            # Normalize orientation / convert to RGB
-            rgb_img = pil_img.convert("RGB")
-            width, height = pil_img.size
-            img_format = pil_img.format or "UNKNOWN"
-            aspect_ratio = f"{round(width / max(height, 1), 2)}:1"
-            orientation = "Landscape" if width > height else ("Portrait" if height > width else "Square")
-
-            # Technical Color & Detail Metrics
-            stat = ImageStat.Stat(rgb_img)
-            r, g, b = stat.mean[:3]
-            brightness = round(0.299 * r + 0.587 * g + 0.114 * b, 1)
-
-            gray_img = pil_img.convert("L")
-            contrast_score = round(ImageStat.Stat(gray_img).stddev[0], 2)
-
-            exif = get_exif_data(pil_img)
-
-            # AI Vision Call
-            if client:
-                ai_data = run_gemini_analysis(client, rgb_img, model_id)
-            else:
-                ai_data = {
-                    "AI Caption": "No API Key Provided",
-                    "AI Category": "Skipped",
-                    "AI Tags": "",
-                    "AI Safety Flag": "Skipped",
-                }
-
-            return {
-                "Item #": index + 1,
-                "File Name": file.name,
-                "Format": img_format,
-                "Size (KB)": file_size_kb,
-                "Dimensions": f"{width}x{height}",
-                "Orientation": orientation,
-                "Brightness (0-255)": brightness,
-                "Sharpness/Contrast": contrast_score,
-                "Camera Model": exif["Camera Model"],
-                "Date Taken": exif["Date Taken"],
-                "AI Caption": ai_data["AI Caption"],
-                "AI Category": ai_data["AI Category"],
-                "AI Tags": ai_data["AI Tags"],
-                "Safety Check": ai_data["AI Safety Flag"],
-                "Status": "Processed",
-            }
-    except Exception as e:
-        return {
-            "Item #": index + 1,
-            "File Name": file.name,
-            "Status": f"Failed: {str(e)}",
-        }
-
-# Process Trigger
 if uploaded_files:
     if len(uploaded_files) > 50:
-        st.warning(f"You selected {len(uploaded_files)} files. Processing capped at the first 50.")
+        st.warning("⚠️ Processing capped at the first 50 files.")
         uploaded_files = uploaded_files[:50]
 
-    # Initialize Gemini client if key present
-    client = None
-    if api_key_input.strip():
-        client = genai.Client(api_key=api_key_input.strip())
+    if not api_key.strip():
+        st.warning("⚠️ Enter your Gemini API key in the sidebar to proceed.")
     else:
-        st.info("💡 Running in metadata-only mode. Enter a Gemini API Key in the left sidebar to enable AI captions and tags.")
+        if st.button("🚀 Process Marksheets & Generate Excel", type="primary"):
+            client = genai.Client(api_key=api_key.strip())
+            progress_bar = st.progress(0)
+            status_text = st.empty()
 
-    if st.button("🚀 Analyze Photos & Build Excel", type="primary"):
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        results = []
-        for idx, f in enumerate(uploaded_files):
-            status_text.text(f"Analyzing {idx + 1}/{len(uploaded_files)}: {f.name}")
-            data = analyze_photo(f, idx, client, model_name)
-            results.append(data)
-            progress_bar.progress((idx + 1) / len(uploaded_files))
+            all_records = []
+            all_discovered_subjects = []
 
-        status_text.text("Analysis complete!")
-        df = pd.DataFrame(results)
+            for idx, f in enumerate(uploaded_files):
+                status_text.text(f"Extracting ({idx+1}/{len(uploaded_files)}): {f.name}")
+                try:
+                    img = Image.open(f).convert("RGB")
+                    data = extract_result(client, img)
 
-        # Overview Metrics
-        st.subheader("📋 Results Preview")
-        st.dataframe(df, use_container_width=True)
+                    reg_no = data.get("register_number", "Unknown")
+                    name = data.get("student_name", "Unknown")
+                    subjects = data.get("subjects", [])
 
-        # Build Formatted Excel Output
-        excel_buffer = io.BytesIO()
-        with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name="Photo_Analysis", index=False)
-            ws = writer.sheets["Photo_Analysis"]
+                    total_marks = 0
+                    failed_subjects = []
+                    row_data = {
+                        "Register Number": reg_no,
+                        "Student Name": name,
+                    }
 
-            # Format Column Widths automatically
-            for col in ws.columns:
-                header_val = str(col[0].value or "")
-                max_content_len = max(len(str(cell.value or "")) for cell in col)
-                col_letter = col[0].column_letter
-                
-                # Give captions and tags adequate space
-                if "Caption" in header_val:
-                    ws.column_dimensions[col_letter].width = 45
-                elif "Tags" in header_val:
-                    ws.column_dimensions[col_letter].width = 30
-                else:
-                    ws.column_dimensions[col_letter].width = max(max_content_len + 3, 12)
+                    for sub in subjects:
+                        code = sub.get("sub_code", "").strip()
+                        s_name = sub.get("subject_name", "").strip()
+                        mark_str = sub.get("marks", "").strip()
+                        res_val = "P" if "P" in sub.get("result", "").upper() else "F"
 
-        st.download_button(
-            label="📥 Download Excel Spreadsheet (.xlsx)",
-            data=excel_buffer.getvalue(),
-            file_name="ai_picture_analysis_report.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+                        subject_col_name = f"{s_name} ({code})" if code else s_name
+                        if subject_col_name not in all_discovered_subjects:
+                            all_discovered_subjects.append(subject_col_name)
+
+                        sub_total = parse_marks(mark_str)
+                        total_marks += sub_total
+
+                        # Show mark string along with fail marker if failed
+                        if res_val == "F":
+                            failed_subjects.append(f"{s_name} ({code})")
+                            row_data[subject_col_name] = f"{sub_total} [FAIL]"
+                        else:
+                            row_data[subject_col_name] = sub_total
+
+                    row_data["Total Marks"] = total_marks
+                    row_data["Result"] = "PASS" if len(failed_subjects) == 0 else "FAIL"
+                    row_data["Arrear Count"] = len(failed_subjects)
+                    row_data["Failed Subjects"] = ", ".join(failed_subjects) if failed_subjects else "None"
+
+                    all_records.append(row_data)
+
+                except Exception as e:
+                    all_records.append({
+                        "Register Number": "Error",
+                        "Student Name": f.name,
+                        "Result": f"Error: {str(e)}",
+                        "Total Marks": 0,
+                        "Failed Subjects": "Error",
+                        "Arrear Count": 0,
+                    })
+
+                progress_bar.progress((idx + 1) / len(uploaded_files))
+
+            status_text.text("Extraction complete!")
+
+            # Reorder columns neatly: Reg No, Name, [All Subjects], Total, Result, Failed Subjects, Arrears
+            final_columns = ["Register Number", "Student Name"] + all_discovered_subjects + [
+                "Total Marks",
+                "Result",
+                "Failed Subjects",
+                "Arrear Count",
+            ]
+
+            df = pd.DataFrame(all_records)
+            # Ensure any missing columns across different images are safely filled with '-'
+            for c in final_columns:
+                if c not in df.columns:
+                    df[c] = "-"
+            df = df[final_columns]
+
+            st.subheader("📋 Class Consolidated Marks")
+            st.dataframe(df, use_container_width=True)
+
+            # Export Excel
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Consolidated_Marks", index=False)
+                ws = writer.sheets["Consolidated_Marks"]
+
+                for col in ws.columns:
+                    header = str(col[0].value or "")
+                    max_len = max(len(str(cell.value or "")) for cell in col)
+                    col_letter = col[0].column_letter
+                    if "Subject" in header or len(header) > 20:
+                        ws.column_dimensions[col_letter].width = max(max_len + 3, 25)
+                    else:
+                        ws.column_dimensions[col_letter].width = max(max_len + 3, 14)
+
+            st.download_button(
+                label="📥 Download Consolidated Marksheet (.xlsx)",
+                data=excel_buffer.getvalue(),
+                file_name="Class_Consolidated_Marksheet.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
