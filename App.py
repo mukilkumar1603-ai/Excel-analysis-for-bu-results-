@@ -54,7 +54,7 @@ def extract_result(client: genai.Client, pil_img: Image.Image) -> dict:
         "Return strictly valid JSON matching schema."
     )
     res = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-1.5-flash",
         contents=[prompt, pil_img],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
